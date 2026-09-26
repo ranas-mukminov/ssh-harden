@@ -47,9 +47,32 @@ Apply backs up `/etc/ssh/sshd_config`, edits a temp copy, runs `sshd -t`, instal
 - Bash 4+ (associative arrays)
 - Root for `--apply`; read access to `sshd_config` for `--audit`
 
+
+## When to use ssh-harden vs AutoHarden
+
+| Tool | Role |
+|------|------|
+| **ssh-harden** (this repo) | Narrow OpenSSH `sshd_config` helper |
+| [AutoHarden-Toolkit](https://github.com/ranas-mukminov/AutoHarden-Toolkit) | Profile CLI (`smb-default`), sysctl/packages/UFW, director MD/PDF report |
+
+ssh-harden is a **subset / optional helper**, not a full CIS suite and not a replacement for AutoHarden.
+
+### Suggested order (K3s Starter / pre-join)
+
+```text
+SSH keys → ssh-harden --audit/--apply (optional)
+        → AutoHarden dry-run → approve → AutoHarden --apply
+        → k3s join (Secure-K3s-GitOps-Template)
+```
+
+- AutoHarden pre-join doc (A4): [k3s-pre-join-bootstrap.md](https://github.com/ranas-mukminov/AutoHarden-Toolkit/blob/main/docs/k3s-pre-join-bootstrap.md)
+- Template: [Secure-K3s-GitOps-Template](https://github.com/ranas-mukminov/Secure-K3s-GitOps-Template)
+- Tracking: [ssh-harden#1](https://github.com/ranas-mukminov/ssh-harden/issues/1)
+
 ## Related
 
-- Full toolkit: [AutoHarden-Toolkit](https://github.com/ranas-mukminov/AutoHarden-Toolkit)
+- Full toolkit: [AutoHarden-Toolkit](https://github.com/ranas-mukminov/AutoHarden-Toolkit) · [K3s pre-join (A4)](https://github.com/ranas-mukminov/AutoHarden-Toolkit/blob/main/docs/k3s-pre-join-bootstrap.md)
+- K3s Starter: [Secure-K3s-GitOps-Template](https://github.com/ranas-mukminov/Secure-K3s-GitOps-Template)
 - Kubernetes FinTech baseline: [k8s-fintech-baseline](https://github.com/ranas-mukminov/k8s-fintech-baseline)
 - Site: [run-as-daemon.dev](https://run-as-daemon.dev) · [run-as-daemon.ru](https://run-as-daemon.ru)
 
