@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# harden.sh — SSH hardening module (CIS-oriented)
-# Usage: ./harden.sh --audit | --apply
+# harden.sh — SSH hardening module (CIS-oriented examples)
+# Usage: ./harden.sh --audit | --apply [--force-match]
 # Audit requires read access to /etc/ssh/sshd_config (typically root or ssh group).
-# Apply requires root, validates config with sshd -t before replacing the live file.
+# Apply requires root, writes a late-loaded drop-in under sshd_config.d, validates
+# with sshd -t / effective settings via sshd -T, then reloads sshd.
 
 set -euo pipefail
 
 LOGFILE="/var/log/autoharden-ssh.log"
 SSHD_CONF="/etc/ssh/sshd_config"
+DROPIN_DIR="/etc/ssh/sshd_config.d"
+DROPIN_FILE="${DROPIN_DIR}/99-autoharden.conf"
+FORCE_MATCH=0
 
 TIMESTAMP() { date +"%Y%m%d-%H%M%S"; }
 DATESTAMP() { date +"%Y-%m-%d %H:%M:%S"; }
@@ -26,9 +30,10 @@ log() {
 }
 
 usage() {
-  echo "Usage: $0 --audit | --apply"
-  echo "  --audit  Report what would change (needs read access to $SSHD_CONF)"
-  echo "  --apply  Backup, validate, then apply changes (requires root)"
+  echo "Usage: $0 --audit | --apply [--force-match]"
+  echo "  --audit         Report effective settings via sshd -T when available"
+  echo "  --apply         Write ${DROPIN_FILE} (last Include drop-in), validate, reload"
+  echo "  --force-match   Allow --apply even if Match stanzas are present"
   exit 2
 }
 
@@ -64,70 +69,143 @@ backup_conf() {
   dest="${SSHD_CONF}.autoharden-${ts}"
   cp -a "$SSHD_CONF" "$dest"
   log "BACKUP: $SSHD_CONF -> $dest"
-}
-
-set_option_in_file() {
-  local key="$1" value="$2" file="$3"
-  local escaped_value
-  escaped_value=$(printf '%s' "$value" | sed -e 's/[&/\\]/\\\\&/g')
-
-  if grep -qE "^[[:space:]]*#?[[:space:]]*${key}[[:space:]]" "$file" \
-    || grep -qE "^[[:space:]]*#?[[:space:]]*${key}$" "$file"; then
-    sed -ri "0,/^[[:space:]]*#?[[:space:]]*${key}\\b/ s|^[[:space:]]*#?[[:space:]]*${key}.*|${key} ${escaped_value}|" "$file"
-  else
-    printf '%s %s\n' "$key" "$value" >> "$file"
+  if [[ -f "$DROPIN_FILE" ]]; then
+    cp -a "$DROPIN_FILE" "${DROPIN_FILE}.autoharden-${ts}"
+    log "BACKUP: $DROPIN_FILE -> ${DROPIN_FILE}.autoharden-${ts}"
   fi
 }
 
-current_value() {
-  local key="$1" file="$2"
+sshd_bin() {
+  local b
+  b=$(command -v sshd || true)
+  if [[ -z "$b" && -x /usr/sbin/sshd ]]; then
+    b=/usr/sbin/sshd
+  fi
+  printf '%s' "$b"
+}
+
+config_has_match() {
+  # Match blocks can override globals/drop-ins depending on file order.
+  # Plain Include of sshd_config.d is expected on Debian/Ubuntu and is how we apply.
+  local f
+  if grep -Eq '^[[:space:]]*Match[[:space:]]' "$SSHD_CONF" 2>/dev/null; then
+    return 0
+  fi
+  if [[ -d "$DROPIN_DIR" ]]; then
+    shopt -s nullglob
+    for f in "$DROPIN_DIR"/*.conf; do
+      [[ "$(basename "$f")" == "$(basename "$DROPIN_FILE")" ]] && continue
+      if grep -Eq '^[[:space:]]*Match[[:space:]]' "$f" 2>/dev/null; then
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+effective_value() {
+  # Prefer sshd -T (effective config). Falls back to first global hit in a file.
+  local key="$1"
+  local bin dump
+  bin=$(sshd_bin)
+  if [[ -n "$bin" ]]; then
+    if dump=$("$bin" -T 2>/dev/null); then
+      awk -v k="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" '
+        BEGIN { IGNORECASE=1 }
+        tolower($1) == k { print $2; exit }
+      ' <<<"$dump"
+      return 0
+    fi
+  fi
   awk -v k="$key" '
     BEGIN { IGNORECASE=1 }
+    $0 ~ /^[[:space:]]*Match[[:space:]]/ { exit }
     $0 ~ "^[[:space:]]*" k "[[:space:]]" { print $2; exit }
-  ' "$file" || true
+  ' "$SSHD_CONF" || true
 }
 
-audit_or_apply_change() {
-  local key="$1" value="$2" mode="$3" file="$4"
-  local current
-  current=$(current_value "$key" "$file")
-
-  if [[ -z "$current" ]]; then
-    echo "Would set $key $value (not present)"
-    if [[ "$mode" == "apply" ]]; then
-      set_option_in_file "$key" "$value" "$file"
-      log "SET: $key $value"
+write_dropin() {
+  mkdir -p "$DROPIN_DIR"
+  local umask_old
+  umask_old=$(umask)
+  umask 077
+  {
+    echo "# Managed by ssh-harden / AutoHarden — do not edit by hand"
+    echo "# Loaded last via Include ${DROPIN_DIR}/*.conf (lexicographic)."
+    local key
+    for key in PasswordAuthentication PermitRootLogin MaxAuthTries X11Forwarding AllowTcpForwarding; do
+      printf '%s %s\n' "$key" "${SETTINGS[$key]}"
+    done
+  } >"$DROPIN_FILE"
+  umask "$umask_old"
+  chmod 600 "$DROPIN_FILE"
+  # Ensure main config includes drop-ins (Debian/Ubuntu default).
+  if ! grep -Eq '^[[:space:]]*Include[[:space:]]+.*/sshd_config\.d/\*' "$SSHD_CONF"; then
+    if ! grep -Eq '^[[:space:]]*Include[[:space:]]+' "$SSHD_CONF"; then
+      printf '\nInclude %s/*.conf\n' "$DROPIN_DIR" >>"$SSHD_CONF"
+      log "INCLUDE: appended Include ${DROPIN_DIR}/*.conf to $SSHD_CONF"
+    else
+      echo "Warning: $SSHD_CONF has Include but not ${DROPIN_DIR}/*.conf — drop-in may not load." >&2
+      log "INCLUDE WARN: drop-in dir may not be included"
     fi
-  elif [[ "$current" != "$value" ]]; then
-    echo "Would set $key $value (current: $current)"
-    if [[ "$mode" == "apply" ]]; then
-      set_option_in_file "$key" "$value" "$file"
-      log "SET: $key $value (was: $current)"
-    fi
-  else
-    echo "$key already set to $value"
   fi
+  log "DROPIN: wrote $DROPIN_FILE"
 }
 
 validate_sshd_config() {
-  local file="$1"
-  local sshd_bin
-  sshd_bin=$(command -v sshd || true)
-  if [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]]; then
-    sshd_bin=/usr/sbin/sshd
-  fi
-  if [[ -z "$sshd_bin" ]]; then
+  local file="${1:-}"
+  local bin
+  bin=$(sshd_bin)
+  if [[ -z "$bin" ]]; then
     echo "sshd binary not found; cannot validate config." >&2
     log "VALIDATE FAILED: sshd not found"
     return 1
   fi
-  if "$sshd_bin" -t -f "$file"; then
-    log "VALIDATE: sshd -t -f $file -> OK"
+  if [[ -n "$file" ]]; then
+    if "$bin" -t -f "$file"; then
+      log "VALIDATE: sshd -t -f $file -> OK"
+      return 0
+    fi
+    echo "sshd config validation failed for $file" >&2
+    log "VALIDATE FAILED: sshd -t -f $file"
+    return 1
+  fi
+  if "$bin" -t; then
+    log "VALIDATE: sshd -t -> OK"
     return 0
   fi
-  echo "sshd config validation failed for $file" >&2
-  log "VALIDATE FAILED: sshd -t -f $file"
+  echo "sshd config validation failed" >&2
+  log "VALIDATE FAILED: sshd -t"
   return 1
+}
+
+assert_effective_settings() {
+  local key value current
+  local bin dump
+  bin=$(sshd_bin)
+  [[ -n "$bin" ]] || return 0
+  dump=$("$bin" -T 2>/dev/null) || {
+    echo "Warning: sshd -T unavailable; skipping effective-value assert." >&2
+    return 0
+  }
+  for key in "${!SETTINGS[@]}"; do
+    value="${SETTINGS[$key]}"
+    current=$(awk -v k="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')" '
+      BEGIN { IGNORECASE=1 }
+      tolower($1) == k { print $2; exit }
+    ' <<<"$dump")
+    if [[ -z "$current" ]]; then
+      echo "Effective setting missing for $key after apply" >&2
+      return 1
+    fi
+    # sshd -T lowercases yes/no
+    if [[ "${current,,}" != "${value,,}" ]]; then
+      echo "Effective $key is '$current', expected '$value' (Match/Include may still override)." >&2
+      echo "Re-run with a representative sshd -T -C user=,host=,addr= or use --force-match after review." >&2
+      return 1
+    fi
+  done
+  return 0
 }
 
 restart_ssh() {
@@ -170,62 +248,86 @@ restart_ssh() {
   return 5
 }
 
-if [[ $# -ne 1 ]]; then
-  usage
-fi
-
 MODE=""
-case "$1" in
-  --audit) MODE="audit" ;;
-  --apply) MODE="apply" ;;
-  *) usage ;;
-esac
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --audit) MODE="audit"; shift ;;
+    --apply) MODE="apply"; shift ;;
+    --force-match) FORCE_MATCH=1; shift ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+
+[[ -n "$MODE" ]] || usage
 
 if [[ ! -r "$SSHD_CONF" ]]; then
   echo "Cannot read $SSHD_CONF (needed for $MODE). Run as a user with read access, usually root." >&2
   exit 1
 fi
 
-WORKFILE=""
+if [[ "$MODE" == "apply" && "$FORCE_MATCH" -eq 0 ]] && config_has_match; then
+  echo "Refusing --apply: Match blocks found in sshd config." >&2
+  echo "Drop-in ${DROPIN_FILE} may still be overridden by later Match stanzas." >&2
+  echo "Review with: sshd -T | grep -Ei 'passwordauthentication|permitrootlogin'" >&2
+  echo "Re-run with --force-match after confirming effective settings for your hosts." >&2
+  exit 1
+fi
+
+WORKDIR=""
 cleanup() {
-  if [[ -n "${WORKFILE:-}" && -f "${WORKFILE:-}" && "$WORKFILE" != "$SSHD_CONF" ]]; then
-    rm -f "$WORKFILE"
+  if [[ -n "${WORKDIR:-}" && -d "${WORKDIR:-}" ]]; then
+    rm -rf "$WORKDIR"
   fi
 }
 trap cleanup EXIT
 
+# Private work dir (not world-readable /tmp)
 if [[ "$MODE" == "apply" ]]; then
   require_root
   check_key_auth_safe
   mkdir -p "$(dirname "$LOGFILE")"
   touch "$LOGFILE"
   backup_conf
-  WORKFILE=$(mktemp /tmp/sshd_config.autoharden.XXXXXX)
-  cp -a "$SSHD_CONF" "$WORKFILE"
+  WORKDIR=$(mktemp -d /root/.ssh-harden.XXXXXX)
 else
-  WORKFILE=$(mktemp /tmp/sshd_config.autoharden.XXXXXX)
-  cp -a "$SSHD_CONF" "$WORKFILE"
+  if [[ $(id -u) -eq 0 ]]; then
+    WORKDIR=$(mktemp -d /root/.ssh-harden.XXXXXX)
+  else
+    WORKDIR=$(mktemp -d "${TMPDIR:-/tmp}/ssh-harden.XXXXXX")
+    chmod 700 "$WORKDIR"
+  fi
 fi
 
-for key in "${!SETTINGS[@]}"; do
+echo "Desired settings:"
+for key in PasswordAuthentication PermitRootLogin MaxAuthTries X11Forwarding AllowTcpForwarding; do
   value="${SETTINGS[$key]}"
-  audit_or_apply_change "$key" "$value" "$MODE" "$WORKFILE"
+  current=$(effective_value "$key")
+  if [[ -z "$current" ]]; then
+    echo "Would set $key $value (effective value unknown / not present)"
+  elif [[ "${current,,}" == "${value,,}" ]]; then
+    echo "$key already effective as $value"
+  else
+    echo "Would set $key $value (effective: $current)"
+  fi
 done
 
 if [[ "$MODE" == "apply" ]]; then
   echo
-  echo "Validating proposed sshd_config..."
-  validate_sshd_config "$WORKFILE"
-  # Atomic-ish replace: install preserves mode when possible
-  install -m 0644 "$WORKFILE" "$SSHD_CONF"
-  log "INSTALL: validated config written to $SSHD_CONF"
+  write_dropin
+  echo "Validating sshd configuration..."
+  validate_sshd_config
+  assert_effective_settings || {
+    echo "Rolling back drop-in due to effective-value mismatch." >&2
+    rm -f "$DROPIN_FILE"
+    exit 1
+  }
   echo "Applying changes and attempting to restart SSH service..."
-  # Re-validate live file before restart
-  validate_sshd_config "$SSHD_CONF"
   restart_ssh
   ret=$?
   if [[ $ret -eq 0 ]]; then
-    echo "All done. Changes logged to $LOGFILE"
+    echo "All done. Drop-in: $DROPIN_FILE (logged to $LOGFILE)"
     exit 0
   fi
   echo "Restart failed (code $ret). Check $LOGFILE and the service status." >&2
@@ -234,5 +336,5 @@ fi
 
 echo
 echo "Audit complete. No live files were modified."
-echo "Requires read access to $SSHD_CONF. Run with --apply as root to apply."
+echo "Effective values prefer sshd -T. Run with --apply as root to write $DROPIN_FILE."
 exit 0
