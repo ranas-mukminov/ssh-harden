@@ -20,6 +20,8 @@ sudo ./harden.sh --audit
 
 # Apply — requires root + non-empty authorized_keys (refuses lockout otherwise)
 sudo ./harden.sh --apply
+# If Match/Include present and you reviewed sshd -T:
+# sudo ./harden.sh --apply --force-match
 ```
 
 ## What it changes (defaults)
@@ -37,8 +39,11 @@ Apply backs up `/etc/ssh/sshd_config`, edits a temp copy, runs `sshd -t`, instal
 ## Safety behavior
 
 - **`--apply` refuses** if the invoking user’s `~/.ssh/authorized_keys` is missing or empty (avoids locking yourself out when disabling passwords).
-- Validates with `sshd -t` **before** replacing the live config and again after install.
-- Writes a timestamped backup: `/etc/ssh/sshd_config.autoharden-<timestamp>`.
+- Writes a late-loaded drop-in `/etc/ssh/sshd_config.d/99-autoharden.conf` instead of rewriting the first matching line in the vendor file (avoids clobbering `Match` blocks).
+- **`--apply` refuses** when `Match` blocks are present unless `--force-match` is set (Debian `Include sshd_config.d` is expected and used for the drop-in). Verify with `sshd -T` (and `sshd -T -C …` for representative Match cases).
+- Audit reports **effective** values via `sshd -T` when available (not a single-file first-line read).
+- Validates with `sshd -t` before reload; backs up main config and any prior drop-in.
+- Work files use a private `mktemp -d` (mode `0700`), not a world-readable `/tmp` copy of `sshd_config`.
 - Logs to `/var/log/autoharden-ssh.log` on apply.
 
 ## Requirements
