@@ -34,7 +34,7 @@ sudo ./harden.sh --apply
 | X11Forwarding | no | Reduce attack surface |
 | AllowTcpForwarding | no | Discourage tunnel misuse |
 
-Apply backs up `/etc/ssh/sshd_config`, edits a temp copy, runs `sshd -t`, installs the validated file, then reloads `sshd`/`ssh`. See script comments for safety checks.
+Apply backs up `/etc/ssh/sshd_config` (and any prior drop-in), writes `/etc/ssh/sshd_config.d/99-autoharden.conf`, validates with `sshd -t` plus effective `sshd -T` checks, then reloads `sshd`/`ssh`. See **Safety behavior** below and script comments.
 
 ## Safety behavior
 
