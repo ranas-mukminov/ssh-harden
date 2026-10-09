@@ -317,15 +317,22 @@ if [[ "$MODE" == "apply" ]]; then
   echo
   write_dropin
   echo "Validating sshd configuration..."
-  validate_sshd_config
+  # Under set -e a failed validation would exit here and leave an invalid
+  # drop-in on disk, so the next sshd restart/boot could fail to start.
+  validate_sshd_config || {
+    echo "Rolling back drop-in due to failed sshd -t validation." >&2
+    rm -f "$DROPIN_FILE"
+    log "ROLLBACK: removed $DROPIN_FILE after failed validation"
+    exit 1
+  }
   assert_effective_settings || {
     echo "Rolling back drop-in due to effective-value mismatch." >&2
     rm -f "$DROPIN_FILE"
     exit 1
   }
   echo "Applying changes and attempting to restart SSH service..."
-  restart_ssh
-  ret=$?
+  ret=0
+  restart_ssh || ret=$?
   if [[ $ret -eq 0 ]]; then
     echo "All done. Drop-in: $DROPIN_FILE (logged to $LOGFILE)"
     exit 0
