@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Drop-in renamed to `sshd_config.d/00-autoharden.conf`. sshd keeps the first value it reads, so `99-` lost to vendor drop-ins such as `50-cloud-init.conf` and `--apply` rolled back. When `sshd_config` has no Include, the Include line now goes at the top instead of the end.
+
 ## [0.1.0] — 2026-09-26
 
 ### Added

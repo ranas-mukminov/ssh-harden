@@ -34,12 +34,12 @@ sudo ./harden.sh --apply
 | X11Forwarding | no | Reduce attack surface |
 | AllowTcpForwarding | no | Discourage tunnel misuse |
 
-Apply backs up `/etc/ssh/sshd_config` (and any prior drop-in), writes `/etc/ssh/sshd_config.d/99-autoharden.conf`, validates with `sshd -t` plus effective `sshd -T` checks, then reloads `sshd`/`ssh`. See **Safety behavior** below and script comments.
+Apply backs up `/etc/ssh/sshd_config` (and any prior drop-in), writes `/etc/ssh/sshd_config.d/00-autoharden.conf`, validates with `sshd -t` plus effective `sshd -T` checks, then reloads `sshd`/`ssh`. See **Safety behavior** below and script comments.
 
 ## Safety behavior
 
 - **`--apply` refuses** if the invoking user’s `~/.ssh/authorized_keys` is missing or empty (avoids locking yourself out when disabling passwords).
-- Writes a late-loaded drop-in `/etc/ssh/sshd_config.d/99-autoharden.conf` instead of rewriting the first matching line in the vendor file (avoids clobbering `Match` blocks).
+- Writes an early-loaded drop-in `/etc/ssh/sshd_config.d/00-autoharden.conf` (sshd keeps the first value it reads, so it must sort before vendor drop-ins like `50-cloud-init.conf`) instead of rewriting the first matching line in the vendor file (avoids clobbering `Match` blocks).
 - **`--apply` refuses** when `Match` blocks are present unless `--force-match` is set (Debian `Include sshd_config.d` is expected and used for the drop-in). Verify with `sshd -T` (and `sshd -T -C …` for representative Match cases).
 - Audit reports **effective** values via `sshd -T` when available (not a single-file first-line read).
 - Validates with `sshd -t` before reload; backs up main config and any prior drop-in.
