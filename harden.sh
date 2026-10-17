@@ -2,7 +2,7 @@
 # harden.sh — SSH hardening module (CIS-oriented examples)
 # Usage: ./harden.sh --audit | --apply [--force-match]
 # Audit requires read access to /etc/ssh/sshd_config (typically root or ssh group).
-# Apply requires root, writes a late-loaded drop-in under sshd_config.d, validates
+# Apply requires root, writes an early-loaded drop-in under sshd_config.d, validates
 # with sshd -t / effective settings via sshd -T, then reloads sshd.
 
 set -euo pipefail
@@ -10,7 +10,10 @@ set -euo pipefail
 LOGFILE="/var/log/autoharden-ssh.log"
 SSHD_CONF="/etc/ssh/sshd_config"
 DROPIN_DIR="/etc/ssh/sshd_config.d"
-DROPIN_FILE="${DROPIN_DIR}/99-autoharden.conf"
+# sshd uses the FIRST value it reads for each keyword, and Include expands
+# sshd_config.d/*.conf in lexical order. Sort first so we beat vendor drop-ins
+# such as 50-cloud-init.conf (PasswordAuthentication yes on Ubuntu clouds).
+DROPIN_FILE="${DROPIN_DIR}/00-autoharden.conf"
 FORCE_MATCH=0
 
 TIMESTAMP() { date +"%Y%m%d-%H%M%S"; }
@@ -32,7 +35,7 @@ log() {
 usage() {
   echo "Usage: $0 --audit | --apply [--force-match]"
   echo "  --audit         Report effective settings via sshd -T when available"
-  echo "  --apply         Write ${DROPIN_FILE} (last Include drop-in), validate, reload"
+  echo "  --apply         Write ${DROPIN_FILE} (first Include drop-in), validate, reload"
   echo "  --force-match   Allow --apply even if Match stanzas are present"
   exit 2
 }
@@ -131,7 +134,7 @@ write_dropin() {
   umask 077
   {
     echo "# Managed by ssh-harden / AutoHarden — do not edit by hand"
-    echo "# Loaded last via Include ${DROPIN_DIR}/*.conf (lexicographic)."
+    echo "# Loaded first via Include ${DROPIN_DIR}/*.conf (lexicographic); first value wins."
     local key
     for key in PasswordAuthentication PermitRootLogin MaxAuthTries X11Forwarding AllowTcpForwarding; do
       printf '%s %s\n' "$key" "${SETTINGS[$key]}"
@@ -142,8 +145,14 @@ write_dropin() {
   # Ensure main config includes drop-ins (Debian/Ubuntu default).
   if ! grep -Eq '^[[:space:]]*Include[[:space:]]+.*/sshd_config\.d/\*' "$SSHD_CONF"; then
     if ! grep -Eq '^[[:space:]]*Include[[:space:]]+' "$SSHD_CONF"; then
-      printf '\nInclude %s/*.conf\n' "$DROPIN_DIR" >>"$SSHD_CONF"
-      log "INCLUDE: appended Include ${DROPIN_DIR}/*.conf to $SSHD_CONF"
+      # Prepend, not append: values earlier in sshd_config would otherwise win,
+      # and an Include after a trailing Match block applies only to that Match.
+      local tmp_conf
+      tmp_conf=$(mktemp "${SSHD_CONF}.XXXXXX")
+      { printf 'Include %s/*.conf\n' "$DROPIN_DIR"; cat "$SSHD_CONF"; } >"$tmp_conf"
+      chmod --reference="$SSHD_CONF" "$tmp_conf" 2>/dev/null || chmod 600 "$tmp_conf"
+      mv -f "$tmp_conf" "$SSHD_CONF"
+      log "INCLUDE: prepended Include ${DROPIN_DIR}/*.conf to $SSHD_CONF"
     else
       echo "Warning: $SSHD_CONF has Include but not ${DROPIN_DIR}/*.conf — drop-in may not load." >&2
       log "INCLUDE WARN: drop-in dir may not be included"
